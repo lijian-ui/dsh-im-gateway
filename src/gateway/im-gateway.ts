@@ -575,6 +575,10 @@ export class ImGatewayService extends Service implements ImGateway {
   }
 
   private async ensureSession(convKey: string): Promise<SessionId> {
+    // An archived conversation can never run a turn (see
+    // `reviveArchivedConversation`), so recover BEFORE handing the id back:
+    // this is the only boundary that still owns it.
+    await this.reviveArchivedConversation(convKey)
     const existing = this.convToSession.get(convKey)
     if (existing) return existing
 
@@ -594,6 +598,90 @@ export class ImGatewayService extends Service implements ImGateway {
     // 消息后生成一次）——补一次前缀，否则旧的 IM 会话永远没有通道标识。
     this.adoptExistingTitle(convKey, sessionId)
     return sessionId
+  }
+
+  /** The session id the current generation maps to (pure; no side effects). */
+  private sessionIdFor(convKey: string): SessionId {
+    const generation = this.sessionGenerations.get(convKey) ?? 0
+    return SessionId(generation === 0 ? `im:${convKey}` : `im:${convKey}:${generation}`)
+  }
+
+  /**
+   * Recover a conversation whose Session was archived (desktop sidebar → 归档).
+   *
+   * The kernel rejects an archived Session **before the first step**
+   * (`archived-session-gate`), so the turn ends `blocked` without a single
+   * model request: the IM message is accepted, the streaming card is opened,
+   * and nothing is ever written to it. From the chat side that looks like
+   * 「思考一会就停了」, and re-sending never helps because the id never changes.
+   * Unarchiving is a Workspace-registry write, not a Session API, so neither
+   * the agent nor the model can clear it on their own.
+   *
+   * Recover here, at the boundary that owns the id:
+   *   1. unarchive — the conversation keeps its history;
+   *   2. if the registry still reports it archived, bump the generation so the
+   *      next id is a genuinely new conversation instead of a dead one.
+   */
+  private async reviveArchivedConversation(convKey: string): Promise<void> {
+    const registry = this.ctx.get('workspaceRegistry') as
+      | {
+        archivedSessionIds?: string[]
+        unarchiveSession?: (sessionId: SessionId) => Promise<void>
+      }
+      | undefined
+    if (!Array.isArray(registry?.archivedSessionIds)) return
+    const unarchive = registry.unarchiveSession?.bind(registry)
+    if (!unarchive) return
+    const isArchived = (sessionId: SessionId): boolean =>
+      registry.archivedSessionIds?.includes(sessionId) === true
+
+    const candidates = new Set<SessionId>()
+    const mapped = this.convToSession.get(convKey)
+    if (mapped) candidates.add(mapped)
+    candidates.add(this.sessionIdFor(convKey))
+
+    for (const sessionId of candidates) {
+      if (!isArchived(sessionId)) continue
+      this.ctx.logger.warn(
+        `[im-gateway] session ${sessionId} is archived — the kernel blocks every turn before the first step; unarchiving`,
+      )
+      try {
+        await unarchive(sessionId)
+      } catch (err) {
+        this.ctx.logger.warn(`[im-gateway] unarchive ${sessionId} failed; rotating instead`, err)
+      }
+      if (!isArchived(sessionId)) continue
+
+      this.ctx.logger.warn(`[im-gateway] session ${sessionId} is still archived → rotating ${convKey} to a new session`)
+      this.releaseSession(convKey, sessionId)
+      this.bumpSessionGeneration(convKey)
+      await this.notifyArchivedRotation(convKey)
+    }
+  }
+
+  /** Drop every in-memory binding of one Session so a fresh id can take over. */
+  private releaseSession(convKey: string, sessionId: SessionId): void {
+    const handle = this.agentHandles.get(sessionId)
+    if (handle) {
+      try { handle.agent.cancel({ kind: 'user' }, { keepInbox: true }) } catch { /* already stopped */ }
+    }
+    this.agentHandles.delete(sessionId)
+    this.modelRefs.delete(sessionId)
+    this.modelOverrides.delete(sessionId)
+    if (this.sessionToConv.get(sessionId) === convKey) this.sessionToConv.delete(sessionId)
+    if (this.convToSession.get(convKey) === sessionId) this.convToSession.delete(convKey)
+    this.clearConversationState(convOf(convKey))
+  }
+
+  /** Tell the user why the previous history stopped being answered. */
+  private async notifyArchivedRotation(convKey: string): Promise<void> {
+    const channel = this.channelForConv(convKey)
+    if (!channel) return
+    try {
+      await channel.sendText(convOf(convKey), this.t.t('gw.session.archivedRotated'))
+    } catch (err) {
+      this.ctx.logger.warn(`[im-gateway] archived-rotation notice failed for ${convKey}`, err)
+    }
   }
 
   /**
@@ -628,7 +716,7 @@ export class ImGatewayService extends Service implements ImGateway {
    */
   private async ensureSessionInner(convKey: string): Promise<SessionId> {
     const generation = this.sessionGenerations.get(convKey) ?? 0
-    const sessionId = SessionId(generation === 0 ? `im:${convKey}` : `im:${convKey}:${generation}`)
+    const sessionId = this.sessionIdFor(convKey)
     const wsPref = this.workspaceOf(convKey)
     // Canonicalize cwd via realpath so session header.cwd matches
     // workspaceRegistry.create's realpath-normalized path exactly. A trailing
