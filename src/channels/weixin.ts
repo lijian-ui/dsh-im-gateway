@@ -40,7 +40,7 @@ import {
 import { StreamingMarkdownFilter } from './markdown-filter'
 import {
   DEFAULT_CDN_BASE_URL,
-  downloadAndDecryptBuffer,
+  downloadAndDecryptBufferBounded,
   uploadLocalFileToWeixin,
 } from './weixin-media'
 
@@ -52,6 +52,11 @@ const TYPING_INTERVAL_MS = 5_000
 const SESSION_EXPIRED_ERRCODE = -14
 /** How long to pause polling after a session-expired error. */
 const SESSION_PAUSE_MS = 5 * 60_000
+
+/** Give up on one inbound image download after this long (falls back to text). */
+const INBOUND_IMAGE_TIMEOUT_MS = 15_000
+/** Inbound image ciphertext cap; larger objects fall back to the [图片] note. */
+const INBOUND_IMAGE_MAX_BYTES = 10 * 1024 * 1024
 
 /** Base URL used unless the QR login returned a different one. */
 export const DEFAULT_WEIXIN_BASE_URL = 'https://ilinkai.weixin.qq.com'
@@ -387,6 +392,9 @@ class WeixinAdapter implements ImChannelAdapter {
     // Download + decrypt any inbound images so the agent sees them
     // (multi-modal). Other media types are ignored for now.
     const images: ImImage[] = []
+    // Set when an image could not be downloaded/decrypted: the message must
+    // still reach the agent as a `[图片]` note instead of being dropped.
+    let imageFailed = false
     for (const item of msg.item_list ?? []) {
       if (item.type !== MessageItemType.IMAGE || !item.image_item) continue
       const img = item.image_item
@@ -396,27 +404,35 @@ class WeixinAdapter implements ImChannelAdapter {
           ? Buffer.from(img.aeskey, 'hex').toString('base64')
           : img.media.aes_key
         if (!aesKeyBase64) continue
-        const buf = await downloadAndDecryptBuffer({
+        const buf = await downloadAndDecryptBufferBounded({
           encryptedQueryParam: img.media.encrypt_query_param ?? '',
           aesKeyBase64,
           cdnBaseUrl: this.cdnBaseUrl,
           label: 'weixin image',
           fullUrl: img.media.full_url,
+          timeoutMs: INBOUND_IMAGE_TIMEOUT_MS,
+          maxBytes: INBOUND_IMAGE_MAX_BYTES,
         })
         images.push({
           mediaType: sniffImageMime(buf),
           data: buf.toString('base64'),
         })
       } catch (err) {
-        this.ctx.logger.warn(`[im-channel-weixin:${this.id}] image download/decrypt failed: ${String(err)}`)
+        imageFailed = true
+        this.ctx.logger.warn(
+          `[im-channel-weixin:${this.id}] image download/decrypt failed —— 退回 [图片] 文本: ${String(err)}`,
+        )
       }
     }
-    if (!text && images.length === 0) return
+    // 纯图消息（没配文字）以前会因为 text 为空被整条丢掉；这里给它一句兜底文本，
+    // 让网关至少能把「有人发了一张图」这件事交给 agent。
+    const bodyText = text || (imageFailed && images.length === 0 ? '[图片]' : '')
+    if (!bodyText && images.length === 0) return
     const message: ImInboundMessage = {
       channelId: this.id,
       conversationId: fromUserId,
       userId: fromUserId,
-      text,
+      text: bodyText,
       images: images.length ? images : undefined,
       messageId: String(msg.message_id ?? msg.seq ?? msg.client_id ?? ''),
     }

@@ -107,6 +107,53 @@ async function fetchCdnBytes(url: string, label: string): Promise<Buffer> {
   return Buffer.from(await res.arrayBuffer())
 }
 
+/**
+ * CDN download bounded by a wall-clock timeout and a hard ciphertext byte cap.
+ * Used by inbound media so one slow or oversized object cannot stall the poll
+ * loop; the caller falls back to a text note on failure.
+ */
+async function fetchCdnBytesBounded(
+  url: string,
+  label: string,
+  timeoutMs: number,
+  maxBytes: number,
+): Promise<Buffer> {
+  const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
+  if (!res.ok) {
+    throw new Error(`${label}: CDN download ${res.status} ${res.statusText}`)
+  }
+  const declared = Number(res.headers.get('content-length') ?? '0')
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    throw new Error(
+      `${label}: CDN object declares ${declared} bytes, over the ${maxBytes} limit`,
+    )
+  }
+  const buf = Buffer.from(await res.arrayBuffer())
+  if (buf.length > maxBytes) {
+    throw new Error(
+      `${label}: CDN object is ${buf.length} bytes, over the ${maxBytes} limit`,
+    )
+  }
+  return buf
+}
+
+/** `downloadAndDecryptBuffer` with the inbound timeout + size caps applied. */
+export async function downloadAndDecryptBufferBounded(params: {
+  encryptedQueryParam: string
+  aesKeyBase64: string
+  cdnBaseUrl: string
+  label: string
+  fullUrl?: string
+  timeoutMs: number
+  maxBytes: number
+}): Promise<Buffer> {
+  const { encryptedQueryParam, aesKeyBase64, cdnBaseUrl, label, fullUrl, timeoutMs, maxBytes } = params
+  const key = parseAesKey(aesKeyBase64, label)
+  const url =
+    fullUrl ?? buildCdnDownloadUrl(encryptedQueryParam, cdnBaseUrl)
+  return decryptAesEcb(await fetchCdnBytesBounded(url, label, timeoutMs, maxBytes), key)
+}
+
 /** Download + AES-128-ECB decrypt a CDN media file. Returns plaintext Buffer. */
 export async function downloadAndDecryptBuffer(params: {
   encryptedQueryParam: string
