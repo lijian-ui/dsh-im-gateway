@@ -107,6 +107,53 @@ async function fetchCdnBytes(url: string, label: string): Promise<Buffer> {
   return Buffer.from(await res.arrayBuffer())
 }
 
+/**
+ * CDN download bounded by a wall-clock timeout and a hard ciphertext byte cap.
+ * Used by inbound media so one slow or oversized object cannot stall the poll
+ * loop; the caller falls back to a text note on failure.
+ */
+async function fetchCdnBytesBounded(
+  url: string,
+  label: string,
+  timeoutMs: number,
+  maxBytes: number,
+): Promise<Buffer> {
+  const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
+  if (!res.ok) {
+    throw new Error(`${label}: CDN download ${res.status} ${res.statusText}`)
+  }
+  const declared = Number(res.headers.get('content-length') ?? '0')
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    throw new Error(
+      `${label}: CDN object declares ${declared} bytes, over the ${maxBytes} limit`,
+    )
+  }
+  const buf = Buffer.from(await res.arrayBuffer())
+  if (buf.length > maxBytes) {
+    throw new Error(
+      `${label}: CDN object is ${buf.length} bytes, over the ${maxBytes} limit`,
+    )
+  }
+  return buf
+}
+
+/** `downloadAndDecryptBuffer` with the inbound timeout + size caps applied. */
+export async function downloadAndDecryptBufferBounded(params: {
+  encryptedQueryParam: string
+  aesKeyBase64: string
+  cdnBaseUrl: string
+  label: string
+  fullUrl?: string
+  timeoutMs: number
+  maxBytes: number
+}): Promise<Buffer> {
+  const { encryptedQueryParam, aesKeyBase64, cdnBaseUrl, label, fullUrl, timeoutMs, maxBytes } = params
+  const key = parseAesKey(aesKeyBase64, label)
+  const url =
+    fullUrl ?? buildCdnDownloadUrl(encryptedQueryParam, cdnBaseUrl)
+  return decryptAesEcb(await fetchCdnBytesBounded(url, label, timeoutMs, maxBytes), key)
+}
+
 /** Download + AES-128-ECB decrypt a CDN media file. Returns plaintext Buffer. */
 export async function downloadAndDecryptBuffer(params: {
   encryptedQueryParam: string
@@ -121,6 +168,27 @@ export async function downloadAndDecryptBuffer(params: {
     fullUrl ?? buildCdnDownloadUrl(encryptedQueryParam, cdnBaseUrl)
   const encrypted = await fetchCdnBytes(url, label)
   return decryptAesEcb(encrypted, key)
+}
+
+// ── Key encoding (outbound) ──
+
+/**
+ * `media.aes_key` for OUTBOUND media must be base64(hex-string-of-key), NOT
+ * base64(raw 16 bytes). The WeChat client decodes base64 → 32 ASCII hex chars
+ * → `fromhex()` → 16-byte AES-128 key. Sending base64(raw) makes the client
+ * derive a wrong key, so AES-128-ECB decryption of the CDN object fails and the
+ * image shows as a grey placeholder that never loads / the file shows as
+ * "expired".
+ *
+ * The receiving side of this plugin tolerates both encodings (see
+ * {@link parseAesKey}), which is why the bug was invisible when testing
+ * bot ↔ bot: only the real WeChat client decodes strictly with `fromhex()`.
+ *
+ * References (all base64(hex)): hermes-agent issue #7529 / PR #7531,
+ * qwen-code PR #4464, the OpeniLink Go SDK and weixin-ilink (Python).
+ */
+export function weixinMediaAesKey(aeskeyHex: string): string {
+  return Buffer.from(aeskeyHex, 'utf-8').toString('base64')
 }
 
 // ── Outbound: encrypt + upload ──
@@ -189,7 +257,7 @@ export type UploadedFileInfo = {
   filekey: string
   /** Fill into media.encrypt_query_param. */
   downloadEncryptedQueryParam: string
-  /** AES key, hex-encoded (convert to base64 for media.aes_key). */
+  /** AES key, hex-encoded — pass through {@link weixinMediaAesKey} for media.aes_key. */
   aeskey: string
   /** Plaintext size in bytes. */
   fileSize: number

@@ -287,9 +287,10 @@ class DingtalkAdapter implements ImChannelAdapter {
     text = stripLeadingMention(text)
 
     // Multimodal seam: `downloadCodes` identifies picture/richText attachments.
-    // Turning them into real ImageBlock attachments needs the
-    // `@deepseek-ai/dsh-attachment` service (tracked). For the PoC the text note
-    // above ("[图片]") is what the agent actually sees.
+    // The gateway can now register `ImImage[]` as real ImageBlocks (see
+    // `ImGatewayService.buildImageBlocks`); DingTalk still has to download these
+    // via the robot media API and fill `images` — until then the text note above
+    // ("[图片]") is what the agent sees.
     const message: ImInboundMessage = {
       channelId: this.id,
       conversationId: peer,

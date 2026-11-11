@@ -10,6 +10,7 @@ import type {
   ImChannelAdapter,
   ImGateway,
   ImGatewayConfig,
+  ImImage,
   ImInboundMessage,
 } from './types'
 import { ApprovalBroker } from './approval'
@@ -152,6 +153,9 @@ export class ImGatewayService extends Service implements ImGateway {
    */
   private static readonly INBOUND_DEDUP_TTL_MS = 5 * 60 * 1000
   private readonly seenInbounds = new Map<string, number>()
+
+  /** 尚未成回合的入站图片（convKey → ImImage[]）。合并窗口期间先攒着，flush 时一起发。 */
+  private readonly pendingImages = new Map<string, ImImage[]>()
 
 
   private readonly agentHandles = new Map<string, AgentHandle>()
@@ -400,6 +404,7 @@ export class ImGatewayService extends Service implements ImGateway {
       this.agentHandles.clear()
       this.convToSession.clear()
       this.sessionToConv.clear()
+      this.pendingImages.clear()
     }
 
     this.active = true
@@ -482,6 +487,73 @@ export class ImGatewayService extends Service implements ImGateway {
 
   // ── inbound → agent ────────────────────────────────────────────────────
 
+  /**
+   * 把入站图片注册成 dsh 附件，返回可直接拼进 content 的 ImageBlock 列表。
+   *
+   * 走宿主 `attachments` 服务（`@deepseek-ai/dsh-attachment`）：
+   * `saveImages([{ data, mediaType }])` → `ImageAttachmentRef[]`，content block
+   * 形状是 `{ type: 'image', attachment }`（不是内联 base64）。
+   *
+   * 健壮性：没有服务 / 单张超过 10MB / 注册超时（15s）/ 注册报错 → 只丢这一张，
+   * 记一行 warn，绝不因此让整条消息失败（调用方会退回 `[图片]` 文本）。
+   */
+  private async buildImageBlocks(images: ImImage[]): Promise<ImageBlock[]> {
+    const blocks: ImageBlock[] = []
+    if (!Array.isArray(images) || images.length === 0) return blocks
+    const attachments = this.ctx.get('attachments') as HostAttachments | undefined
+    if (!attachments || typeof attachments.saveImages !== 'function') {
+      this.ctx.logger.warn(
+        "[im-gateway] 收到图片，但宿主没有 attachments 服务（ctx.get('attachments') 为空）—— 退回文字",
+      )
+      return blocks
+    }
+    for (const image of images) {
+      if (!image || typeof image.data !== 'string' || image.data.length === 0) continue
+      try {
+        const bytes = Buffer.from(image.data, 'base64')
+        if (bytes.length === 0) continue
+        if (bytes.length > IM_IMAGE_MAX_BYTES) {
+          this.ctx.logger.warn(
+            `[im-gateway] 入站图片 ${bytes.length} 字节，超过 ${IM_IMAGE_MAX_BYTES} 上限 —— 退回文字`,
+          )
+          continue
+        }
+        const refs = await withTimeout(
+          attachments.saveImages([{ data: bytes, mediaType: toImageMediaType(image.mediaType) }]),
+          IM_IMAGE_REGISTER_TIMEOUT_MS,
+        )
+        const ref = Array.isArray(refs) ? refs[0] : undefined
+        if (ref) blocks.push({ type: 'image', attachment: ref })
+        else this.ctx.logger.warn('[im-gateway] 附件服务未返回图片引用 —— 退回文字')
+      } catch (err) {
+        this.ctx.logger.warn(
+          `[im-gateway] 入站图片注册失败 —— 退回文字: ${err instanceof Error ? err.message : String(err)}`,
+        )
+      }
+    }
+    return blocks
+  }
+
+  /**
+   * 组装一个回合的 content：文字（含群聊前缀）+ 已注册的图片 block。
+   * 合并窗口里攒下的图片在这里一次取走（drain），同一个会话不会重复发送。
+   */
+  private async buildUserContent(convKey: string, message: ContentTextSource): Promise<ContentBlock[]> {
+    const images = this.pendingImages.get(convKey) ?? []
+    this.pendingImages.delete(convKey)
+    const blocks = await this.buildImageBlocks(images)
+    const hasText = typeof message.text === 'string' && message.text.trim() !== ''
+    // 纯图无文字：补一句 `[图片]` 兜底，模型和看日志的人都能知道这条消息里有图。
+    const source = hasText || images.length === 0 ? message : { ...message, text: IM_IMAGE_FALLBACK_TEXT }
+    const content = toContentBlocks(source, blocks)
+    // Never hand the agent an empty content list. An empty text turn keeps its
+    // raw (empty) text block exactly as before; an image turn already got the note.
+    if (content.length === 0) {
+      content.push({ type: 'text', text: typeof message.text === 'string' ? message.text : '' })
+    }
+    return content
+  }
+
   async handleInbound(message: ImInboundMessage): Promise<void> {
     // Process-level dedup — catches duplicates from concurrent adapter
     // instances (dev HMR, reconnect races). Adapter's own dedup only covers
@@ -540,17 +612,31 @@ export class ImGatewayService extends Service implements ImGateway {
       if (handled) return
     }
 
-    // 提问答复检测：有 pending 提问时尝试解析为答案，不转发给 agent
-    if (await this.answerQuestion(channel, message)) return
-
+    // 提问答复检测：有 pending 提问时尝试解析为答案，不转发给 agent。
+    // 纯图消息（没有文字）不能被当成「答非所问」吞掉 —— 否则图片永远到不了
+    // agent，用户还以为消息发了出去。
+    const hasText = typeof message.text === 'string' && message.text.trim() !== ''
+    if (hasText && await this.answerQuestion(channel, message)) return
 
     const convKey = `${message.channelId}:${message.conversationId}`
 
-    // 多段输入合并：用户连续发多条消息时合并为一条再提交给 agent
-    const mergeResult = this.merger?.ingest(convKey, message.text)
+    // 入站图片先攒进 pendingImages：合并窗口内可能还有后续消息，flush 时一起发。
+    const inboundImages = (Array.isArray(message.images) ? message.images : []).filter(
+      (img) => img && typeof img.data === 'string' && img.data.length > 0,
+    )
+    if (inboundImages.length > 0) {
+      this.pendingImages.set(convKey, [...(this.pendingImages.get(convKey) ?? []), ...inboundImages])
+    }
+    // 既没有文字也没有图片：没有任何可提交的内容（例如只有语音/文件的消息）。
+    if (!hasText && inboundImages.length === 0) return
+
+    // 多段输入合并：用户连续发多条消息时合并为一条再提交给 agent。
+    // 纯图消息用它自己的 `[图片]` 兜底文本进窗口 —— 空字符串会被 merger 当成
+    // ignored 丢掉，那正是「微信纯图被整条静默丢弃」的根因。
+    const mergeResult = this.merger?.ingest(convKey, hasText ? message.text : IM_IMAGE_FALLBACK_TEXT)
     if (mergeResult && mergeResult.kind === 'flushed' && mergeResult.text) {
       const sessionId = await this.ensureSession(convKey)
-      const parts = toContentBlocks({ ...message, text: mergeResult.text })
+      const parts = await this.buildUserContent(convKey, { ...message, text: mergeResult.text })
       // Serialize turns per conversation so a fast second message waits for the first.
       const prev = this.serialQueues.get(convKey) ?? Promise.resolve()
       const next = prev.then(() => this.runTurn(sessionId, convKey, channel, parts))
@@ -562,10 +648,15 @@ export class ImGatewayService extends Service implements ImGateway {
   /** 合并窗口超时回调：把合并后的文本注入 agent。 */
   private async onMergeFlush(convKey: string, text: string): Promise<void> {
     const channel = this.channelForConv(convKey)
-    if (!channel) return
+    if (!channel) {
+      // 会话已经没了：攒着的图片一起丢掉，别让 Map 无限长。
+      this.pendingImages.delete(convKey)
+      return
+    }
     try {
       const sessionId = await this.ensureSession(convKey)
-      const parts: ContentBlock[] = [{ type: 'text', text }]
+      // 窗口里攒下的图片在这里统一取走（drain）。
+      const parts = await this.buildUserContent(convKey, { text })
       const prev = this.serialQueues.get(convKey) ?? Promise.resolve()
       const next = prev.then(() => this.runTurn(sessionId, convKey, channel, parts))
       this.serialQueues.set(convKey, next.catch(() => undefined))
@@ -1076,12 +1167,16 @@ export class ImGatewayService extends Service implements ImGateway {
     }
     const convId = convOf(convKey)
     try {
-      if (caption) await channel.sendText(convId, caption).catch(() => undefined)
+      // caption 只发一次：各渠道的 sendMedia 实现内部已经先发 caption
+      // （weixin / qq / dingtalk / feishu / wecom 的 sendMedia 都有这一步），
+      // 这里再发一次就会变成两条重复的附言。只有没有 sendMedia、走文本降级
+      // 时才需要补发。
       if (channel.sendMedia) {
         await channel.sendMedia(convId, filePath, caption)
         return { ok: true, detail: this.t.t('gw.sendFile.sent', filePath) }
       }
       // 渠道不支持发送文件 → 降级为文本说明
+      if (caption) await channel.sendText(convId, caption).catch(() => undefined)
       await channel.sendText(convId, this.t.t('gw.sendFile.fallbackText', filePath))
       return { ok: true, detail: this.t.t('gw.sendFile.fallbackDetail', filePath) }
     } catch (err) {
@@ -1419,14 +1514,14 @@ function convOf(convKey: string): string {
 /**
  * Build dsh ContentBlock[] from a normalized inbound message.
  *
- * PoC is TEXT-ONLY. Real multimodal requires registering raw bytes with the
- * `@deepseek-ai/dsh-attachment` service to obtain an `ImageAttachmentRef`
- * (the actual `ImageBlock` shape is `{ type: 'image'; attachment }`, NOT inline
- * base64). That is a tracked seam: inbound images currently arrive as the
- * "[图片]" text note the channel adapter emits. Wire `ctx.attachments` before
- * enabling vision.
+ * Text (with the group-chat sender prefix) is always the FIRST block. Inbound
+ * images arrive on `message.images` as `{ mediaType, data }` (raw base64); the
+ * gateway registers them with the host `attachments` service and passes the
+ * resulting `ImageBlock[]` here as `imageBlocks`. Those blocks are
+ * `{ type: 'image', attachment }` — a durable `ImageAttachmentRef`, NOT inline
+ * base64 (see `ImGatewayService.buildImageBlocks`).
  */
-function toContentBlocks(message: ImInboundMessage): ContentBlock[] {
+function toContentBlocks(message: ContentTextSource, imageBlocks?: ImageBlock[]): ContentBlock[] {
   const blocks: ContentBlock[] = []
   if (message.text) {
     // In group chats, attribute who spoke so the agent can tell members apart
@@ -1434,7 +1529,73 @@ function toContentBlocks(message: ImInboundMessage): ContentBlock[] {
     const text = message.isGroup && message.senderNick ? `[@${message.senderNick}] ${message.text}` : message.text
     blocks.push({ type: 'text', text })
   }
+  if (Array.isArray(imageBlocks)) for (const block of imageBlocks) blocks.push(block)
   return blocks
+}
+
+/** An inbound-message field subset wide enough to build the text block. */
+type ContentTextSource = Pick<ImInboundMessage, 'text' | 'isGroup' | 'senderNick'>
+
+/** The `image` member of dsh's merge-extensible content-block union. */
+type ImageBlock = Extract<ContentBlock, { type: 'image' }>
+
+/** Durable host-side reference to a stored image (dsh `ImageAttachmentRef`). */
+type ImageAttachmentRef = ImageBlock['attachment']
+
+/**
+ * Structural view of the host attachment service (`@deepseek-ai/dsh-attachment`,
+ * mounted as `ctx.attachments`). Declared locally — and only as wide as this
+ * plugin needs — so the plugin takes no compile-time dependency on that
+ * package: the service is looked up at runtime and its absence degrades to the
+ * `[图片]` text note instead of breaking the channel.
+ */
+interface HostAttachments {
+  saveImages(inputs: readonly SaveImageAttachment[]): Promise<readonly ImageAttachmentRef[]>
+}
+
+/** One encoded image handed to the host store (`dsh` `SaveImageAttachment`). */
+interface SaveImageAttachment {
+  data: Uint8Array
+  mediaType: ImageAttachmentRef['mediaType']
+  name?: string
+}
+
+/** Text note used when an inbound image could not become an attachment block. */
+const IM_IMAGE_FALLBACK_TEXT = '[图片]'
+
+/** Inbound images larger than this (raw bytes) fall back to the text note. */
+const IM_IMAGE_MAX_BYTES = 10 * 1024 * 1024
+
+/** Give up registering one inbound image after this long — fall back to text. */
+const IM_IMAGE_REGISTER_TIMEOUT_MS = 15_000
+
+/**
+ * Narrow an adapter-declared MIME type to one the host store accepts. Adapters
+ * sniff the type from magic bytes, so this is a best-effort label: the store
+ * re-validates (and decodes) the bytes itself, and a mismatch falls back to the
+ * text note through `buildImageBlocks`' catch.
+ */
+function toImageMediaType(mediaType: string): ImageAttachmentRef['mediaType'] {
+  switch (mediaType) {
+    case 'image/png':
+    case 'image/jpeg':
+    case 'image/webp':
+    case 'image/gif':
+      return mediaType
+    default:
+      return 'image/jpeg'
+  }
+}
+
+/** Reject after `ms` unless `promise` settles first (the loser settles unobserved). */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_resolve, reject) => {
+    // Deliberately NOT unref'd: this timer is the only thing that settles a hung
+    // promise, so it must fire even when nothing else keeps the loop alive.
+    timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms)
+  })
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
 }
 
 

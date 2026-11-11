@@ -31,6 +31,7 @@ English | [简体中文](./README.md)
 - **Long reply splitting** — replies exceeding the channel's single-message limit are auto-split at sentence boundaries with `（1/3）` segment prefixes, sent as separate messages.
 - **Multi-segment input merge** — consecutive messages are auto-merged into one (configurable timeout window); use `..` to continue merging, `!!` to submit immediately.
 - **File-sending tool** — the agent can call `im_send_file` to send workspace files (images/videos/documents) directly to the current IM session.
+- **Inbound images** — images received on WeChat/Feishu are registered as dsh attachments (`{ type: 'image', attachment }`) and handed to the model with the message; when the host has no `attachments` service, a single image exceeds 10 MB, or registration times out, the turn degrades to a "[图片]" text note instead of dropping the message.
 - **Bilingual UI** — set `language: 'zh' | 'en'` to switch all user-visible replies between Chinese and English.
 
 ### Session Management
