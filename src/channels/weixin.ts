@@ -42,6 +42,7 @@ import {
   DEFAULT_CDN_BASE_URL,
   downloadAndDecryptBufferBounded,
   uploadLocalFileToWeixin,
+  weixinMediaAesKey,
 } from './weixin-media'
 
 const LONG_POLL_TIMEOUT_MS = 35_000
@@ -553,9 +554,12 @@ class WeixinAdapter implements ImChannelAdapter {
             image_item: {
               media: {
                 encrypt_query_param: uploaded.downloadEncryptedQueryParam,
-                aes_key: Buffer.from(uploaded.aeskey, 'hex').toString('base64'),
+                aes_key: weixinMediaAesKey(uploaded.aeskey),
                 encrypt_type: 1,
               },
+              // 微信客户端读图片时优先用 image_item.aeskey（32 字符 hex）；
+              // media.aes_key 是 base64(hex) 的兼容写法。两个都给最稳。
+              aeskey: uploaded.aeskey,
               mid_size: uploaded.fileSizeCiphertext,
             },
           }
@@ -564,7 +568,7 @@ class WeixinAdapter implements ImChannelAdapter {
             file_item: {
               media: {
                 encrypt_query_param: uploaded.downloadEncryptedQueryParam,
-                aes_key: Buffer.from(uploaded.aeskey, 'hex').toString('base64'),
+                aes_key: weixinMediaAesKey(uploaded.aeskey),
                 encrypt_type: 1,
               },
               file_name: basename(filePath),

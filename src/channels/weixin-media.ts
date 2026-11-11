@@ -170,6 +170,27 @@ export async function downloadAndDecryptBuffer(params: {
   return decryptAesEcb(encrypted, key)
 }
 
+// ── Key encoding (outbound) ──
+
+/**
+ * `media.aes_key` for OUTBOUND media must be base64(hex-string-of-key), NOT
+ * base64(raw 16 bytes). The WeChat client decodes base64 → 32 ASCII hex chars
+ * → `fromhex()` → 16-byte AES-128 key. Sending base64(raw) makes the client
+ * derive a wrong key, so AES-128-ECB decryption of the CDN object fails and the
+ * image shows as a grey placeholder that never loads / the file shows as
+ * "expired".
+ *
+ * The receiving side of this plugin tolerates both encodings (see
+ * {@link parseAesKey}), which is why the bug was invisible when testing
+ * bot ↔ bot: only the real WeChat client decodes strictly with `fromhex()`.
+ *
+ * References (all base64(hex)): hermes-agent issue #7529 / PR #7531,
+ * qwen-code PR #4464, the OpeniLink Go SDK and weixin-ilink (Python).
+ */
+export function weixinMediaAesKey(aeskeyHex: string): string {
+  return Buffer.from(aeskeyHex, 'utf-8').toString('base64')
+}
+
 // ── Outbound: encrypt + upload ──
 
 const UPLOAD_MAX_RETRIES = 3
@@ -236,7 +257,7 @@ export type UploadedFileInfo = {
   filekey: string
   /** Fill into media.encrypt_query_param. */
   downloadEncryptedQueryParam: string
-  /** AES key, hex-encoded (convert to base64 for media.aes_key). */
+  /** AES key, hex-encoded — pass through {@link weixinMediaAesKey} for media.aes_key. */
   aeskey: string
   /** Plaintext size in bytes. */
   fileSize: number

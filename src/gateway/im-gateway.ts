@@ -1167,12 +1167,16 @@ export class ImGatewayService extends Service implements ImGateway {
     }
     const convId = convOf(convKey)
     try {
-      if (caption) await channel.sendText(convId, caption).catch(() => undefined)
+      // caption 只发一次：各渠道的 sendMedia 实现内部已经先发 caption
+      // （weixin / qq / dingtalk / feishu / wecom 的 sendMedia 都有这一步），
+      // 这里再发一次就会变成两条重复的附言。只有没有 sendMedia、走文本降级
+      // 时才需要补发。
       if (channel.sendMedia) {
         await channel.sendMedia(convId, filePath, caption)
         return { ok: true, detail: this.t.t('gw.sendFile.sent', filePath) }
       }
       // 渠道不支持发送文件 → 降级为文本说明
+      if (caption) await channel.sendText(convId, caption).catch(() => undefined)
       await channel.sendText(convId, this.t.t('gw.sendFile.fallbackText', filePath))
       return { ok: true, detail: this.t.t('gw.sendFile.fallbackDetail', filePath) }
     } catch (err) {
